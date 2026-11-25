@@ -20,6 +20,7 @@ an alternative script "offset_recon_fanBeam_CPU.py".
 """
 #%%
 
+import os
 import numpy as np
 import math
 from matplotlib import pyplot as plt
@@ -184,8 +185,8 @@ def apply_filter(sino,filter_name='ramp'):
     sino = np.fft.ifftshift(sino, axes=1)
     sino = np.fft.ifft(sino, axis=1)
 
-    # remove padding
-    sino = sino[:,pad_left:-pad_left]
+    # remove padding (pad_right may be one more than pad_left)
+    sino = sino[:,pad_left:pad_left+columns]
 
     # remove imaginary component
     sino = np.real(sino)
@@ -198,34 +199,31 @@ if astra.use_cuda():
     print('Found GPU, continuing.')
     
     
-    # generating a phantom of default size 400 x 400
-    phantom = shepp_logan_phantom()
-    phantom = np.expand_dims(phantom,0)
-    
-    # setting and calculating some arbitrary geometry parameters
-    distance_source_origin = 800 # [mm]
-    distance_origin_detector = 200 # [mm]
-    detector_pixel_size =  20**(-3) # [mm]
-    no_projections = 721
+    # geometry parameters of data/leya (LeapCTRecon/cfg/CTRecon.ini)
+    distance_source_origin = 433 # [mm]
+    distance_origin_detector = 660 - 433 # [mm]
+    detector_pixel_size =  157.7/512 # [mm]
+    no_projections = 537
     angular_range = 360
-    num_rows = 1 
-    num_columns = 256
+    num_rows = 512
+    num_columns = 512
     
     mag = (distance_source_origin+distance_origin_detector)/distance_source_origin
     
-    eff_pix_size = detector_pixel_size/mag
+    # voxel size of the reconstruction, as in CTRecon.ini (the demo used detector_pixel_size/mag)
+    eff_pix_size = 0.25 # [mm]
     
     # array containing angles, flipped as convention to fit the acquisition software in our system
     angles = np.flip((np.linspace(0, angular_range*2*np.pi/360, num=no_projections, endpoint=False)))
     
     # offset is defined as the distance between the perpendicular line from the source to the centre of the detector,
-    # and the centre of rotation
-    offset = 80 
+    # and the centre of rotation; data/leya has an offset detector (offDetecU = -32.7 mm, offDetecV = -35 mm) [pixels]
+    offset = -32.7/detector_pixel_size
     
     # setting deltaU as the offset, not this step may be used to adjust the vectors depending on how the offset is defined
     deltaU = offset
-    # deltaV is unused, can be optionally included to account for imperfect geometry alignment
-    deltaV = 0
+    # deltaV is the vertical detector offset
+    deltaV = -35/detector_pixel_size
     
     # these are left unused, assumed well aligned geometry
     eta=np.radians(0) # In plane rotation(skew)
@@ -269,8 +267,7 @@ if astra.use_cuda():
         # vector from detector pixel (0,0) to (1,0) 
         V_vecs[i,:]=np.array([0, 0,  detector_pixel_size/eff_pix_size])
         
-        # Vector Transformations
-        S_vecs[i,:] = S_vecs[i,:] + deltaU * U_vecs[i,:] + deltaV * V_vecs[i,:]
+        # Vector Transformations (offset detector: only the detector moves, the source stays on the central ray)
         D_vecs[i,:] = D_vecs[i,:] + deltaU * U_vecs[i,:] + deltaV * V_vecs[i,:]
         U_vecs[i,:] = np.dot(M_rot, U_vecs[i,:])
         V_vecs[i,:] = np.dot(M_rot, V_vecs[i,:])
@@ -283,57 +280,60 @@ if astra.use_cuda():
     vecs[:, 6:9] = U_vecs
     vecs[:,9:] = V_vecs
     
-    # simulating an offset fan-beam scan and showing the sinogram
-    vol_geom = astra.creators.create_vol_geom(400, 400, 1)
+    # 600 x 600 x 400 volume as in CTRecon.ini, centred along z on the illuminated region (DSO/DSD * offDetecV)
+    oz = distance_source_origin/(distance_source_origin+distance_origin_detector) * deltaV*detector_pixel_size/eff_pix_size
+    vol_geom = astra.creators.create_vol_geom(600, 600, 400, -300, 300, -300, 300, -200+oz, 200+oz)
     
     proj_geom = astra.create_proj_geom('cone_vec', num_rows, num_columns, vecs)
     
-    sinogram_id, sinogram = astra.create_sino3d_gpu(phantom, proj_geom, vol_geom, returnData=True)
+    # loading the data/leya scan (frame k is file 20+k) as line integrals, in ASTRA's (rows, angles, columns) order
+    leya_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data', 'leya')
+    air = np.fromfile(os.path.join(leya_dir, '0000.raw'), np.uint16).reshape(num_rows, num_columns).astype(float)
+    sinogram = np.stack([-np.log(np.maximum(np.fromfile(os.path.join(leya_dir, '27', 'raw537', '%04d.raw' % (20+k)),
+                         np.uint16).reshape(num_rows, num_columns), 1) / air) for k in range(no_projections)], axis=1)
     
     plt.imshow(sinogram[0,:,:],cmap='gray')
-
+    
 else:
     print('No GPU found, running this script will crash kernel. Please use "offset_recon_fanBeam_CPU.py" instead for a CPU-compatible version.')
 
 #%% carrying out post-convolution weighted FBP
 
-dat = np.copy(sinogram[0,:,:])
+dat = np.copy(sinogram)
 dat = dat.astype(float)
 
-# applying some variation of the ramp filter to dampen low-frequency components
-dat = apply_filter(dat,filter_name='ramp')
+# FDK cosine weighting for the cone beam (the demo was effectively parallel-beam), u and v from the central ray
+u = (np.arange(num_columns) - (num_columns-1)/2 + deltaU) * detector_pixel_size
+v = (np.arange(num_rows) - (num_rows-1)/2 + deltaV) * detector_pixel_size
+SDD = distance_source_origin + distance_origin_detector
+dat = dat * SDD / np.sqrt(SDD**2 + u[None,None,:]**2 + v[:,None,None]**2)
 
-# must expand dims as this is a 3D geometry
-dat = np.expand_dims(dat,0)
+# applying some variation of the ramp filter to dampen low-frequency components, row by row
+dat = np.stack([apply_filter(dat[r],filter_name='ramp') for r in range(num_rows)])
 
 # getting reconstruction now as an intermediate result to show naive reconstruction without weighting
 [idd, volume_noWeight] = astra.create_backprojection3d_gpu(dat, proj_geom, vol_geom, returnData=True)
 
-# normalising the reconstruction
-volume_noWeight = volume_noWeight * np.pi / (2 * no_projections)
+# normalising the reconstruction, in [1/mm] (the extra factor is 1/eff_pix_size for the demo's voxel size)
+volume_noWeight = volume_noWeight * np.pi / (2 * no_projections) * detector_pixel_size / (eff_pix_size**2 * mag)
 
-# apply offset geometry weighting POST ramp filter
-dat,_ = apply_weighting_offsetCOR(dat[0,:,:],offset,detector_pixel_size,distance_source_origin,distance_origin_detector)
-
-dat = np.expand_dims(dat,0)
+# apply offset geometry weighting POST ramp filter; an offset detector sees the centre of rotation at the same angle as
+# an offset centre of rotation of offset/mag pixels
+_,y = apply_weighting_offsetCOR(dat[0,:,:],offset/mag,detector_pixel_size,distance_source_origin,distance_origin_detector)
+dat = dat * y
 
 [idd, volume_post] = astra.create_backprojection3d_gpu(dat, proj_geom, vol_geom, returnData=True)
 
-# normalising the reconstruction
-volume_post = volume_post * np.pi / (2 * no_projections)
+# normalising the reconstruction, in [1/mm]
+volume_post = volume_post * np.pi / (2 * no_projections) * detector_pixel_size / (eff_pix_size**2 * mag)
 
-plt.subplot(1,3,1)
-plt.imshow(phantom[0,:,:],cmap='gray',vmin=0,vmax=0.8)
-plt.axis('off')
-plt.title('Phantom')
-
-plt.subplot(1,3,2)
-plt.imshow(volume_noWeight[0,:,:],cmap='gray',vmin=0,vmax=0.8)
+plt.subplot(1,2,1)
+plt.imshow(volume_noWeight[200,:,:],cmap='gray',vmin=0,vmax=0.05)
 plt.axis('off')
 plt.title('Recon: no weight')
 
-plt.subplot(1,3,3)
-plt.imshow(volume_post[0,:,:],cmap='gray',vmin=0,vmax=0.8)
+plt.subplot(1,2,2)
+plt.imshow(volume_post[200,:,:],cmap='gray',vmin=0,vmax=0.05)
 plt.axis('off')
 plt.title('Recon: weighted')
 
